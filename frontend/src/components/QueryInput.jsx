@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from "react";
 
+const API_BASE_URL = "/api";
+
 const QueryInput = () => {
   const [query, setQuery] = useState("");
   const [conversations, setConversations] = useState([]);
@@ -8,6 +10,8 @@ const QueryInput = () => {
   const [selectedPdf, setSelectedPdf] = useState("");
   const [error, setError] = useState(null);
   const [expandedIndex, setExpandedIndex] = useState(null);
+  const [isNewConversation, setIsNewConversation] = useState(true);
+  const [isResetting, setIsResetting] = useState(false);
 
   useEffect(() => {
     fetchPdfFiles();
@@ -15,9 +19,12 @@ const QueryInput = () => {
 
   const fetchPdfFiles = async () => {
     try {
-      const response = await fetch("http://127.0.0.1:5000/api/pdf-files");
+      const response = await fetch(`${API_BASE_URL}/pdf-files`);
       const data = await response.json();
       setPdfFiles(data.pdf_files);
+      if (data.pdf_files.length > 0 && !selectedPdf) {
+        setSelectedPdf(data.pdf_files[0]);
+      }
     } catch (error) {
       console.error("Error fetching PDF files:", error);
       setError("Failed to fetch PDF files. Please try again later.");
@@ -30,7 +37,7 @@ const QueryInput = () => {
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch("http://127.0.0.1:5000/api/query", {
+      const response = await fetch(`${API_BASE_URL}/query`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -38,18 +45,27 @@ const QueryInput = () => {
         body: JSON.stringify({
           query,
           pdf_name: selectedPdf,
-          conversation_history: conversations,
+          conversation_history: isNewConversation ? [] : conversations,
+          is_new_conversation: isNewConversation,
         }),
       });
       const data = await response.json();
       if (response.ok) {
-        setConversations((prev) => [
-          ...prev,
-          { role: "human", content: query },
-          { role: "ai", content: data.response },
-        ]);
+        if (isNewConversation) {
+          setConversations([
+            { role: "human", content: query },
+            { role: "ai", content: data.response },
+          ]);
+        } else {
+          setConversations((prev) => [
+            ...prev,
+            { role: "human", content: query },
+            { role: "ai", content: data.response },
+          ]);
+        }
         setQuery("");
         setExpandedIndex(null);
+        setIsNewConversation(false);
       } else {
         console.error("Error from server:", data);
         setError(`Error from server: ${data.error}`);
@@ -60,6 +76,14 @@ const QueryInput = () => {
     } finally {
       setLoading(false);
     }
+  };
+
+  const toggleNewConversation = () => {
+    setIsNewConversation(true);
+    setConversations([]);
+    setSelectedPdf("");
+    setIsResetting(true);
+    setTimeout(() => setIsResetting(false), 500);
   };
 
   const toggleExpand = (index) => {
@@ -110,8 +134,11 @@ const QueryInput = () => {
     <div className="flex max-w-6xl mx-auto p-4 bg-transparent min-h-screen text-white font-sans">
       <div className="flex-grow mr-4">
         <h1
-          className="text-3xl font-bold mb-4 text-white"
-          style={{ textStroke: "1px black", WebkitTextStroke: "1px black" }}
+          className="text-4xl font-semibold mb-4 text-white"
+          style={{
+            textShadow: "4px 4px 10px rgba(0, 0, 0, 0.8)",
+            WebkitTextStroke: "1px white",
+          }}
         >
           Ask and receive
         </h1>
@@ -121,7 +148,7 @@ const QueryInput = () => {
               value={selectedPdf}
               onChange={(e) => setSelectedPdf(e.target.value)}
               className="w-full p-2 border border-gray-600 bg-gray-800 text-white rounded"
-              disabled={conversations.length > 0}
+              disabled={!isNewConversation && conversations.length > 0}
             >
               <option value="">Select a PDF</option>
               {pdfFiles.map((pdf) => (
@@ -137,13 +164,28 @@ const QueryInput = () => {
               className="w-full p-2 border border-gray-600 bg-gray-800 text-white placeholder-gray-400 rounded resize-none"
               rows="3"
             />
-            <button
-              type="submit"
-              disabled={loading || !selectedPdf || !query.trim()}
-              className="px-4 py-2 shadow-lg bg-red-600 text-black rounded hover:bg-red-700 disabled:bg-gray-700 transition duration-300"
-            >
-              {loading ? "Querying..." : "Submit Query"}
-            </button>
+            <div className="flex justify-between items-center">
+              <button
+                type="submit"
+                disabled={loading || !selectedPdf || !query.trim()}
+                className="px-4 py-2 shadow-lg bg-red-600 text-black rounded hover:bg-red-700 disabled:bg-gray-700 transition duration-300"
+              >
+                {loading ? "Querying..." : "Submit Query"}
+              </button>
+              <button
+                type="button"
+                onClick={toggleNewConversation}
+                className={`px-4 py-2 shadow-lg rounded transition duration-300 w-40 h-10 flex items-center justify-center ${
+                  isNewConversation
+                    ? "bg-green-600 text-white hover:bg-green-700"
+                    : "bg-blue-600 text-white hover:bg-blue-700"
+                }`}
+              >
+                <span className="truncate">
+                  {isResetting ? "Resetting..." : "New Convo"}
+                </span>
+              </button>
+            </div>
           </div>
         </form>
 

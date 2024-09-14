@@ -48,19 +48,21 @@ class LlamaParser:
         self.indexes[file_name] = index
         return index
 
-    def query_pdf(self, file_name, query, chat_history):
+    def query_pdf(self, file_name, query, chat_history, is_new_conversation):
         logger.debug(f"Querying PDF: {file_name}")
         logger.debug(f"Query: {query}")
         logger.debug(f"Chat history: {chat_history}")
+        logger.debug(f"Is new conversation: {is_new_conversation}")
 
         if file_name not in self.indexes:
             self.parse_and_embed_pdf(file_name)
         
         memory = ChatMemoryBuffer.from_defaults(token_limit=1500)
         
-        for message in chat_history:
-            role = MessageRole.USER if message['role'] == 'human' else MessageRole.ASSISTANT
-            memory.put(ChatMessage(role=role, content=message['content']))
+        if not is_new_conversation:
+            for message in chat_history[-4:]:  # Only use the last 2 exchanges (4 messages)
+                role = MessageRole.USER if message['role'] == 'human' else MessageRole.ASSISTANT
+                memory.put(ChatMessage(role=role, content=message['content']))
         
         chat_engine = CondenseQuestionChatEngine.from_defaults(
             query_engine=self.indexes[file_name].as_query_engine(),
@@ -90,12 +92,13 @@ def api_query():
     query = data.get('query')
     pdf_name = data.get('pdf_name')
     conversation_history = data.get('conversation_history', [])
+    is_new_conversation = data.get('is_new_conversation', False)
     
     if not query or not pdf_name:
         return jsonify({'error': 'Query and PDF name are required'}), 400
 
     try:
-        response = parser.query_pdf(pdf_name, query, conversation_history)
+        response = parser.query_pdf(pdf_name, query, conversation_history, is_new_conversation)
         return jsonify({'query': query, 'response': response})
     except Exception as e:
         logger.error(f"An error occurred: {str(e)}")
@@ -103,4 +106,4 @@ def api_query():
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5000)
