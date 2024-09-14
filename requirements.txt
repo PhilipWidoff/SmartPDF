@@ -37,6 +37,7 @@ marshmallow==3.22.0
 multidict==6.0.5
 mypy-extensions==1.0.0
 nest-asyncio==1.6.0
+networkx==3.3
 nltk==3.9.1
 numpy==1.26.4
 openai==1.43.0
