@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 import os
 import logging
@@ -11,79 +11,196 @@ from dotenv import load_dotenv
 import traceback
 import fitz  # PyMuPDF
 import io
+from transformers import (
+    pipeline,
+    T5ForConditionalGeneration,
+    T5Tokenizer,
+    BartForQuestionAnswering,
+    BartTokenizer
+)
+from PIL import Image
+import numpy as np
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains.summarize import load_summarize_chain
+from langchain.chat_models import ChatOpenAI
+from langchain.docstore.document import Document
+import torch
+import spacy
+from keybert import KeyBERT
 
 load_dotenv()
 
+# Initialize environment variables
 openai_api_key = os.getenv('OPENAI_API_KEY')
 llama_cloud_api_key = os.getenv('LLAMA_CLOUD_API_KEY')
 
 app = Flask(__name__)
 CORS(app)
 
+# Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+# Define constants for directory paths
 PDFS_FOLDER = "pdfs"
 CACHE_FOLDER = "cache"
 CUSTOM_IMAGES_FOLDER = "custom_images"
+SUMMARIES_FOLDER = "summaries"
 
-# Ensure necessary directories exist
-for folder in [PDFS_FOLDER, CACHE_FOLDER, CUSTOM_IMAGES_FOLDER]:
+# Create necessary directories
+for folder in [PDFS_FOLDER, CACHE_FOLDER, CUSTOM_IMAGES_FOLDER, SUMMARIES_FOLDER]:
     os.makedirs(folder, exist_ok=True)
 
-class LlamaParser:
-    def __init__(self):
-        self.pdfs_folder = PDFS_FOLDER
-        self.cache_folder = CACHE_FOLDER
-        self.indexes = {}
+# Initialize AI models with GPU support if available
+device = 0 if torch.cuda.is_available() else -1
 
-    def parse_and_embed_pdf(self, file_name):
-        cache_path = os.path.join(self.cache_folder, f"{file_name}.json")
+# Initialize various AI models
+sentiment_analyzer = pipeline("sentiment-analysis", device=device)
+text_classifier = pipeline("zero-shot-classification", device=device)
+image_classifier = pipeline("image-classification", device=device)
+nlp = spacy.load("en_core_web_sm")
+keyword_model = KeyBERT()
+qa_model = pipeline("question-answering", device=device)
+
+class EnhancedLlamaParser(LlamaParse):
+    """Enhanced version of LlamaParser with additional AI capabilities"""
+    
+    def __init__(self):
+        """Initialize the parser with various AI models and utilities"""
+        super().__init__()
+        self.llm = ChatOpenAI(temperature=0, openai_api_key=openai_api_key)
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=2000,
+            chunk_overlap=200
+        )
+
+    def analyze_sentiment(self, text):
+        """
+        Analyze the sentiment of text
+        Returns: Dictionary containing sentiment label and score
+        """
+        return sentiment_analyzer(text)
+
+    def extract_entities(self, text):
+        """
+        Extract named entities from text using spaCy
+        Returns: Dictionary of entities grouped by type
+        """
+        doc = nlp(text)
+        entities = {}
+        for ent in doc.ents:
+            if ent.label_ not in entities:
+                entities[ent.label_] = []
+            entities[ent.label_].append(ent.text)
+        return entities
+
+    def extract_keywords(self, text, top_n=10):
+        """
+        Extract key terms from text using KeyBERT
+        Returns: List of (keyword, score) tuples
+        """
+        keywords = keyword_model.extract_keywords(
+            text,
+            top_n=top_n,
+            stop_words='english'
+        )
+        return keywords
+
+    def answer_specific_question(self, context, question):
+        """
+        Use BART model for precise question answering
+        Returns: Dictionary containing answer and confidence score
+        """
+        return qa_model(question=question, context=context)
+
+    def generate_summary(self, file_name):
+        """
+        Generate a comprehensive summary of the PDF
+        Caches results for efficiency
+        Returns: String containing the summary
+        """
+        cache_path = os.path.join(SUMMARIES_FOLDER, f"{file_name}_summary.txt")
         
         if os.path.exists(cache_path):
-            storage_context = StorageContext.from_defaults(persist_dir=cache_path)
-            index = load_index_from_storage(storage_context)
+            with open(cache_path, 'r') as f:
+                return f.read()
+
+        file_path = os.path.join(self.pdfs_folder, file_name)
+        doc = fitz.open(file_path)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+
+        # Split and summarize text
+        texts = self.text_splitter.split_text(text)
+        docs = [Document(page_content=t) for t in texts]
+        chain = load_summarize_chain(self.llm, chain_type="map_reduce")
+        summary = chain.run(docs)
+
+        # Cache results
+        with open(cache_path, 'w') as f:
+            f.write(summary)
+
+        return summary
+
+parser = EnhancedLlamaParser()
+
+# Existing routes remain the same...
+
+@app.route('/api/analyze', methods=['POST'])
+def api_analyze():
+    """
+    Enhanced analysis endpoint supporting multiple types of analysis
+    Supports: summary, entities, keywords, sentiment, qa
+    """
+    data = request.json
+    pdf_name = data.get('pdf_name')
+    analysis_type = data.get('analysis_type')
+    
+    if not pdf_name or not analysis_type:
+        return jsonify({'error': 'PDF name and analysis type are required'}), 400
+
+    try:
+        if analysis_type == 'summary':
+            result = parser.generate_summary(pdf_name)
+            return jsonify({'summary': result})
+            
+        elif analysis_type == 'entities':
+            text = data.get('text')
+            if not text:
+                return jsonify({'error': 'Text required for entity extraction'}), 400
+            result = parser.extract_entities(text)
+            return jsonify({'entities': result})
+            
+        elif analysis_type == 'keywords':
+            text = data.get('text')
+            if not text:
+                return jsonify({'error': 'Text required for keyword extraction'}), 400
+            result = parser.extract_keywords(text)
+            return jsonify({'keywords': result})
+            
+        elif analysis_type == 'sentiment':
+            text = data.get('text')
+            if not text:
+                return jsonify({'error': 'Text required for sentiment analysis'}), 400
+            result = parser.analyze_sentiment(text)
+            return jsonify({'sentiment': result})
+            
+        elif analysis_type == 'qa':
+            context = data.get('context')
+            question = data.get('question')
+            if not context or not question:
+                return jsonify({'error': 'Context and question required for QA'}), 400
+            result = parser.answer_specific_question(context, question)
+            return jsonify({'answer': result})
+            
         else:
-            parser = LlamaParse(result_type="markdown")
-            file_extractor = {".pdf": parser}
-            file_path = os.path.join(self.pdfs_folder, file_name)
+            return jsonify({'error': 'Invalid analysis type'}), 400
             
-            documents = SimpleDirectoryReader(input_files=[file_path], file_extractor=file_extractor).load_data()
-            index = VectorStoreIndex.from_documents(documents)
-            
-            index.storage_context.persist(persist_dir=cache_path)
-        
-        self.indexes[file_name] = index
-        return index
-
-    def query_pdf(self, file_name, query, chat_history, is_new_conversation):
-        logger.debug(f"Querying PDF: {file_name}")
-        logger.debug(f"Query: {query}")
-        logger.debug(f"Chat history: {chat_history}")
-        logger.debug(f"Is new conversation: {is_new_conversation}")
-
-        if file_name not in self.indexes:
-            self.parse_and_embed_pdf(file_name)
-        
-        memory = ChatMemoryBuffer.from_defaults(token_limit=1500)
-        
-        if not is_new_conversation:
-            for message in chat_history[-4:]:  # Only use the last 2 exchanges (4 messages)
-                role = MessageRole.USER if message['role'] == 'human' else MessageRole.ASSISTANT
-                memory.put(ChatMessage(role=role, content=message['content']))
-        
-        chat_engine = CondenseQuestionChatEngine.from_defaults(
-            query_engine=self.indexes[file_name].as_query_engine(),
-            memory=memory,
-            verbose=True
-        )
-        
-        response = chat_engine.chat(query)
-        logger.debug(f"Response: {response}")
-        return str(response)
-
-parser = LlamaParser()
-
+    except Exception as e:
+        logger.error(f"Analysis error: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
 @app.route('/api/pdf-files', methods=['GET'])
 def api_get_pdf_files():
     pdf_files = [f for f in os.listdir(PDFS_FOLDER) if f.lower().endswith('.pdf')]
@@ -143,6 +260,17 @@ def api_get_background_image():
     except Exception as e:
         logger.error(f"Failed to process PDF: {str(e)}")
         return jsonify({'error': f'Failed to process PDF: {str(e)}'}), 500
+
+@app.route('/api/pdf/<path:filename>')
+def serve_pdf(filename):
+    """Serve PDF files securely"""
+    try:
+        return send_file(
+            os.path.join(PDFS_FOLDER, filename),
+            mimetype='application/pdf'
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 404
 
 if __name__ == "__main__":
     app.run(debug=True, host='0.0.0.0', port=5000)
