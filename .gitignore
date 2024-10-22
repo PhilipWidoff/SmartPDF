@@ -28,3 +28,7 @@ backend/__pycache__/
 *.njsproj
 *.sln
 *.sw?
+
+# Provided images and documents
+fh rulebook.png
+fh rulebook.pdf
