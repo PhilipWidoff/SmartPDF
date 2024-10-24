@@ -60,14 +60,12 @@ keybert_model = KeyBERT()
 
 class LlamaParser:
     def __init__(self):
-        """Initialize the parser with necessary models and tools"""
         self.pdfs_folder = PDFS_FOLDER
         self.cache_folder = CACHE_FOLDER
         self.indexes = {}
         self.tfidf = TfidfVectorizer(stop_words='english')
 
     def parse_and_embed_pdf(self, file_name):
-        """Parse and embed PDF content for vector search"""
         cache_path = os.path.join(self.cache_folder, f"{file_name}.json")
         logger.debug(f"Attempting to parse PDF: {file_name}")
         logger.debug(f"Cache path: {cache_path}")
@@ -93,6 +91,81 @@ class LlamaParser:
         except Exception as e:
             logger.error(f"Error parsing PDF: {str(e)}")
             raise
+
+    def query_pdf(self, file_name, query, chat_history, is_new_conversation):
+        """Query the PDF and include page information"""
+        logger.debug(f"Querying PDF: {file_name}")
+        logger.debug(f"Query: {query}")
+    
+        if file_name not in self.indexes:
+            self.parse_and_embed_pdf(file_name)
+    
+        memory = ChatMemoryBuffer.from_defaults(token_limit=1500)
+    
+        if not is_new_conversation:
+            for message in chat_history[-4:]:
+                role = MessageRole.USER if message['role'] == 'human' else MessageRole.ASSISTANT
+                memory.put(ChatMessage(role=role, content=message['content']))
+    
+        chat_engine = CondenseQuestionChatEngine.from_defaults(
+            query_engine=self.indexes[file_name].as_query_engine(),
+            memory=memory,
+            verbose=True
+        )
+    
+        response = str(chat_engine.chat(query))
+    
+        # Always check for page references
+        page_info = self.find_content_pages(file_name, response)
+    
+        return {
+            'response': response,
+            'has_location': bool(page_info),
+            'pages': page_info
+        }
+
+    def find_content_pages(self, file_name, content):
+        """Find pages containing specific content and detect explicit page mentions"""
+        try:
+            # First check for explicit page numbers in the response
+            page_numbers = []
+            # Look for patterns like "page 31" or "on page 31"
+            import re
+            page_mentions = re.findall(r'page\s+(\d+)|on page\s+(\d+)', content.lower())
+            for mention in page_mentions:
+                # Combine the groups and filter out empty matches
+                page_num = next(filter(None, mention))
+                if page_num:
+                    page_numbers.append(int(page_num))
+
+            if page_numbers:
+                # If explicit page numbers were found, use those
+                return [{'page': page_num, 'preview': f'Referenced on page {page_num}'} 
+                    for page_num in page_numbers]
+
+            # If no explicit page numbers, fall back to content search
+            file_path = os.path.join(self.pdfs_folder, file_name)
+            doc = fitz.open(file_path)
+            page_info = []
+        
+            # Convert content into searchable chunks
+            content_chunks = [chunk.strip() for chunk in content.lower().split('.') if chunk.strip()]
+        
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                text = page.get_text().lower()
+            
+                # Check if page contains any of the content chunks
+                if any(chunk in text for chunk in content_chunks):
+                    page_info.append({
+                        'page': page_num + 1,
+                        'preview': text[:200] + '...'
+                    })
+        
+            return page_info
+        except Exception as e:
+            logger.error(f"Error finding content pages: {str(e)}")
+            return []
 
     def extract_key_topics(self, text, num_topics=5):
         """Extract main topics from text using KeyBERT"""
@@ -163,32 +236,6 @@ class LlamaParser:
             logger.error(f"Error extracting PDF text: {str(e)}")
             return ""
 
-    def query_pdf(self, file_name, query, chat_history, is_new_conversation):
-        """Query the PDF using LlamaIndex"""
-        logger.debug(f"Querying PDF: {file_name}")
-        logger.debug(f"Query: {query}")
-        logger.debug(f"Chat history: {chat_history}")
-        
-        if file_name not in self.indexes:
-            self.parse_and_embed_pdf(file_name)
-        
-        memory = ChatMemoryBuffer.from_defaults(token_limit=1500)
-        
-        if not is_new_conversation:
-            for message in chat_history[-4:]:  # Only use last 2 exchanges
-                role = MessageRole.USER if message['role'] == 'human' else MessageRole.ASSISTANT
-                memory.put(ChatMessage(role=role, content=message['content']))
-        
-        chat_engine = CondenseQuestionChatEngine.from_defaults(
-            query_engine=self.indexes[file_name].as_query_engine(),
-            memory=memory,
-            verbose=True
-        )
-        
-        response = chat_engine.chat(query)
-        logger.debug(f"Response: {response}")
-        return str(response)
-
 # Initialize parser
 parser = LlamaParser()
 
@@ -228,8 +275,13 @@ def api_query():
         return jsonify({'error': 'Query and PDF name are required'}), 400
 
     try:
-        response = parser.query_pdf(pdf_name, query, conversation_history, is_new_conversation)
-        return jsonify({'query': query, 'response': response})
+        response_data = parser.query_pdf(pdf_name, query, conversation_history, is_new_conversation)
+        return jsonify({
+            'query': query,
+            'response': response_data['response'],
+            'has_location': response_data.get('has_location', False),
+            'pages': response_data.get('pages', [])
+        })
     except Exception as e:
         logger.error(f"Query error: {str(e)}")
         logger.error(traceback.format_exc())
@@ -238,7 +290,6 @@ def api_query():
 @app.route('/api/analyze', methods=['POST', 'OPTIONS'])
 def api_analyze():
     """Endpoint for analyzing PDF content"""
-    # Handle OPTIONS request for CORS
     if request.method == 'OPTIONS':
         return '', 204
 
@@ -251,22 +302,17 @@ def api_analyze():
             return jsonify({'error': 'PDF name and analysis type are required'}), 400
 
         logger.debug(f"Analyzing PDF: {pdf_name}, Type: {analysis_type}")
-        
-        # Get text from PDF
         text = parser.get_pdf_text(pdf_name)
         
         if analysis_type == 'topics':
             topics = parser.extract_key_topics(text)
             return jsonify({'topics': topics})
-            
         elif analysis_type == 'entities':
             entities = parser.extract_named_entities(text)
             return jsonify({'entities': entities})
-            
         elif analysis_type == 'readability':
             readability = parser.analyze_readability(text)
             return jsonify({'readability': readability})
-            
         else:
             return jsonify({'error': 'Invalid analysis type'}), 400
             
