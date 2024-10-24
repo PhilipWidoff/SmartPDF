@@ -1,11 +1,10 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { debounce } from 'lodash';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 
 // Base URL for API calls
-const API_BASE_URL = "/api";
+const API_BASE_URL = "http://localhost:5000/api";
 
 const QueryInput = ({ onPdfSelect, isCustomImage }) => {
   // State declarations
@@ -19,8 +18,6 @@ const QueryInput = ({ onPdfSelect, isCustomImage }) => {
   const [isNewConversation, setIsNewConversation] = useState(true);
   const [isResetting, setIsResetting] = useState(false);
   const [isFetchingPdfs, setIsFetchingPdfs] = useState(false);
-  
-  // New state for enhanced features
   const [showPdfViewer, setShowPdfViewer] = useState(false);
   const [analysisResults, setAnalysisResults] = useState(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -59,45 +56,6 @@ const QueryInput = ({ onPdfSelect, isCustomImage }) => {
     fetchPdfFiles();
     return () => abortController.current.abort();
   }, [fetchPdfFiles]);
-
-  // Debounced query input handler
-  const debouncedSetQuery = useCallback(
-    debounce((value) => setQuery(value), 300),
-    []
-  );
-
-  // Toggle PDF viewer
-  const togglePdfViewer = () => {
-    setShowPdfViewer(!showPdfViewer);
-  };
-
-  // Handle PDF analysis
-  const analyzeDocument = async (analysisType) => {
-    setIsAnalyzing(true);
-    setError(null);
-    try {
-      const response = await fetch(`${API_BASE_URL}/analyze`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          pdf_name: selectedPdf,
-          analysis_type: analysisType,
-        }),
-      });
-      
-      if (!response.ok) throw new Error('Analysis failed');
-      const data = await response.json();
-      setAnalysisResults(data);
-      setActiveAnalysisTab(analysisType);
-    } catch (error) {
-      console.error("Analysis error:", error);
-      setError("Failed to analyze document");
-    } finally {
-      setIsAnalyzing(false);
-    }
-  };
 
   // Handle query submission
   const handleSubmit = async (e) => {
@@ -150,6 +108,39 @@ const QueryInput = ({ onPdfSelect, isCustomImage }) => {
     setConversations([]);
     setShowPdfViewer(false);
     setAnalysisResults(null);
+  };
+
+  // Toggle PDF viewer
+  const togglePdfViewer = () => {
+    setShowPdfViewer(!showPdfViewer);
+  };
+
+  // Handle document analysis
+  const analyzeDocument = async (analysisType) => {
+    setIsAnalyzing(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE_URL}/analyze`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          pdf_name: selectedPdf,
+          analysis_type: analysisType,
+        }),
+      });
+      
+      if (!response.ok) throw new Error('Analysis failed');
+      const data = await response.json();
+      setAnalysisResults(data);
+      setActiveAnalysisTab(analysisType);
+    } catch (error) {
+      console.error("Analysis error:", error);
+      setError("Failed to analyze document");
+    } finally {
+      setIsAnalyzing(false);
+    }
   };
 
   // Start new conversation
@@ -290,7 +281,7 @@ const QueryInput = ({ onPdfSelect, isCustomImage }) => {
 
               <textarea
                 value={query}
-                onChange={(e) => debouncedSetQuery(e.target.value)}
+                onChange={(e) => setQuery(e.target.value)}  // Direct update without debounce
                 placeholder="Enter your query"
                 className="w-full p-2 border border-gray-600 bg-gray-800 text-yellow-500 placeholder-yellow-300 rounded resize-none"
                 rows="3"

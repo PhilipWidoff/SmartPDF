@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import os
 import logging
@@ -11,205 +11,213 @@ from dotenv import load_dotenv
 import traceback
 import fitz  # PyMuPDF
 import io
-from transformers import (
-    pipeline,
-    T5ForConditionalGeneration,
-    T5Tokenizer,
-    BartForQuestionAnswering,
-    BartTokenizer
-)
-from PIL import Image
-import numpy as np
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains.summarize import load_summarize_chain
-from langchain.chat_models import ChatOpenAI
-from langchain.docstore.document import Document
+from transformers import pipeline
 import torch
 import spacy
 from keybert import KeyBERT
+from sklearn.feature_extraction.text import TfidfVectorizer
 
+# Load environment variables
 load_dotenv()
 
-# Initialize environment variables
-openai_api_key = os.getenv('OPENAI_API_KEY')
-llama_cloud_api_key = os.getenv('LLAMA_CLOUD_API_KEY')
-
-app = Flask(__name__)
-CORS(app)
-
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# Define constants for directory paths
+# Initialize Flask app
+app = Flask(__name__)
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["http://localhost:5173"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"]
+    }
+})
+
+# Define constants for folder paths
 PDFS_FOLDER = "pdfs"
 CACHE_FOLDER = "cache"
 CUSTOM_IMAGES_FOLDER = "custom_images"
-SUMMARIES_FOLDER = "summaries"
+ANALYSIS_CACHE_FOLDER = "analysis_cache"
 
 # Create necessary directories
-for folder in [PDFS_FOLDER, CACHE_FOLDER, CUSTOM_IMAGES_FOLDER, SUMMARIES_FOLDER]:
+for folder in [PDFS_FOLDER, CACHE_FOLDER, CUSTOM_IMAGES_FOLDER, ANALYSIS_CACHE_FOLDER]:
     os.makedirs(folder, exist_ok=True)
+
+# Initialize NLP models
+try:
+    nlp = spacy.load("en_core_web_sm")
+except:
+    os.system("python -m spacy download en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")
 
 # Initialize AI models with GPU support if available
 device = 0 if torch.cuda.is_available() else -1
+keybert_model = KeyBERT()
 
-# Initialize various AI models
-sentiment_analyzer = pipeline("sentiment-analysis", device=device)
-text_classifier = pipeline("zero-shot-classification", device=device)
-image_classifier = pipeline("image-classification", device=device)
-nlp = spacy.load("en_core_web_sm")
-keyword_model = KeyBERT()
-qa_model = pipeline("question-answering", device=device)
-
-class EnhancedLlamaParser(LlamaParse):
-    """Enhanced version of LlamaParser with additional AI capabilities"""
-    
+class LlamaParser:
     def __init__(self):
-        """Initialize the parser with various AI models and utilities"""
-        super().__init__()
-        self.llm = ChatOpenAI(temperature=0, openai_api_key=openai_api_key)
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=2000,
-            chunk_overlap=200
-        )
+        """Initialize the parser with necessary models and tools"""
+        self.pdfs_folder = PDFS_FOLDER
+        self.cache_folder = CACHE_FOLDER
+        self.indexes = {}
+        self.tfidf = TfidfVectorizer(stop_words='english')
 
-    def analyze_sentiment(self, text):
-        """
-        Analyze the sentiment of text
-        Returns: Dictionary containing sentiment label and score
-        """
-        return sentiment_analyzer(text)
-
-    def extract_entities(self, text):
-        """
-        Extract named entities from text using spaCy
-        Returns: Dictionary of entities grouped by type
-        """
-        doc = nlp(text)
-        entities = {}
-        for ent in doc.ents:
-            if ent.label_ not in entities:
-                entities[ent.label_] = []
-            entities[ent.label_].append(ent.text)
-        return entities
-
-    def extract_keywords(self, text, top_n=10):
-        """
-        Extract key terms from text using KeyBERT
-        Returns: List of (keyword, score) tuples
-        """
-        keywords = keyword_model.extract_keywords(
-            text,
-            top_n=top_n,
-            stop_words='english'
-        )
-        return keywords
-
-    def answer_specific_question(self, context, question):
-        """
-        Use BART model for precise question answering
-        Returns: Dictionary containing answer and confidence score
-        """
-        return qa_model(question=question, context=context)
-
-    def generate_summary(self, file_name):
-        """
-        Generate a comprehensive summary of the PDF
-        Caches results for efficiency
-        Returns: String containing the summary
-        """
-        cache_path = os.path.join(SUMMARIES_FOLDER, f"{file_name}_summary.txt")
+    def parse_and_embed_pdf(self, file_name):
+        """Parse and embed PDF content for vector search"""
+        cache_path = os.path.join(self.cache_folder, f"{file_name}.json")
+        logger.debug(f"Attempting to parse PDF: {file_name}")
+        logger.debug(f"Cache path: {cache_path}")
         
-        if os.path.exists(cache_path):
-            with open(cache_path, 'r') as f:
-                return f.read()
-
-        file_path = os.path.join(self.pdfs_folder, file_name)
-        doc = fitz.open(file_path)
-        text = ""
-        for page in doc:
-            text += page.get_text()
-
-        # Split and summarize text
-        texts = self.text_splitter.split_text(text)
-        docs = [Document(page_content=t) for t in texts]
-        chain = load_summarize_chain(self.llm, chain_type="map_reduce")
-        summary = chain.run(docs)
-
-        # Cache results
-        with open(cache_path, 'w') as f:
-            f.write(summary)
-
-        return summary
-
-parser = EnhancedLlamaParser()
-
-# Existing routes remain the same...
-
-@app.route('/api/analyze', methods=['POST'])
-def api_analyze():
-    """
-    Enhanced analysis endpoint supporting multiple types of analysis
-    Supports: summary, entities, keywords, sentiment, qa
-    """
-    data = request.json
-    pdf_name = data.get('pdf_name')
-    analysis_type = data.get('analysis_type')
-    
-    if not pdf_name or not analysis_type:
-        return jsonify({'error': 'PDF name and analysis type are required'}), 400
-
-    try:
-        if analysis_type == 'summary':
-            result = parser.generate_summary(pdf_name)
-            return jsonify({'summary': result})
+        try:
+            if os.path.exists(cache_path):
+                logger.debug("Loading from cache...")
+                storage_context = StorageContext.from_defaults(persist_dir=cache_path)
+                index = load_index_from_storage(storage_context)
+            else:
+                logger.debug("Creating new index...")
+                parser = LlamaParse(result_type="markdown")
+                file_path = os.path.join(self.pdfs_folder, file_name)
+                documents = SimpleDirectoryReader(
+                    input_files=[file_path], 
+                    file_extractor={".pdf": parser}
+                ).load_data()
+                index = VectorStoreIndex.from_documents(documents)
+                index.storage_context.persist(persist_dir=cache_path)
             
-        elif analysis_type == 'entities':
-            text = data.get('text')
-            if not text:
-                return jsonify({'error': 'Text required for entity extraction'}), 400
-            result = parser.extract_entities(text)
-            return jsonify({'entities': result})
+            self.indexes[file_name] = index
+            return index
+        except Exception as e:
+            logger.error(f"Error parsing PDF: {str(e)}")
+            raise
+
+    def extract_key_topics(self, text, num_topics=5):
+        """Extract main topics from text using KeyBERT"""
+        try:
+            keywords = keybert_model.extract_keywords(
+                text,
+                keyphrase_ngram_range=(1, 2),
+                stop_words='english',
+                use_maxsum=True,
+                nr_candidates=20,
+                top_n=num_topics
+            )
+            return [keyword for keyword, _ in keywords]
+        except Exception as e:
+            logger.error(f"Error extracting topics: {str(e)}")
+            return []
+
+    def extract_named_entities(self, text):
+        """Extract and categorize named entities from text"""
+        try:
+            doc = nlp(text)
+            entities = {}
+            for ent in doc.ents:
+                if ent.label_ not in entities:
+                    entities[ent.label_] = []
+                if ent.text not in entities[ent.label_]:  # Avoid duplicates
+                    entities[ent.label_].append(ent.text)
+            return entities
+        except Exception as e:
+            logger.error(f"Error extracting entities: {str(e)}")
+            return {}
+
+    def analyze_readability(self, text):
+        """Analyze text readability using various metrics"""
+        try:
+            doc = nlp(text)
             
-        elif analysis_type == 'keywords':
-            text = data.get('text')
-            if not text:
-                return jsonify({'error': 'Text required for keyword extraction'}), 400
-            result = parser.extract_keywords(text)
-            return jsonify({'keywords': result})
+            words = len([token for token in doc if not token.is_punct])
+            sentences = len(list(doc.sents))
+            syllables = sum([len([y for y in x if y.lower() in 'aeiou']) 
+                           for x in [token.text for token in doc]])
             
-        elif analysis_type == 'sentiment':
-            text = data.get('text')
-            if not text:
-                return jsonify({'error': 'Text required for sentiment analysis'}), 400
-            result = parser.analyze_sentiment(text)
-            return jsonify({'sentiment': result})
-            
-        elif analysis_type == 'qa':
-            context = data.get('context')
-            question = data.get('question')
-            if not context or not question:
-                return jsonify({'error': 'Context and question required for QA'}), 400
-            result = parser.answer_specific_question(context, question)
-            return jsonify({'answer': result})
-            
-        else:
-            return jsonify({'error': 'Invalid analysis type'}), 400
-            
-    except Exception as e:
-        logger.error(f"Analysis error: {str(e)}")
-        logger.error(traceback.format_exc())
-        return jsonify({'error': str(e)}), 500
+            if sentences > 0:
+                flesch = 206.835 - 1.015 * (words/sentences) - 84.6 * (syllables/words)
+            else:
+                flesch = 0
+                
+            return {
+                "flesch_score": round(flesch, 2),
+                "avg_sentence_length": round(words/sentences if sentences > 0 else 0, 2),
+                "total_words": words,
+                "total_sentences": sentences
+            }
+        except Exception as e:
+            logger.error(f"Error analyzing readability: {str(e)}")
+            return {}
+
+    def get_pdf_text(self, file_name):
+        """Extract raw text from PDF file"""
+        try:
+            file_path = os.path.join(self.pdfs_folder, file_name)
+            doc = fitz.open(file_path)
+            text = ""
+            for page in doc:
+                text += page.get_text()
+            return text
+        except Exception as e:
+            logger.error(f"Error extracting PDF text: {str(e)}")
+            return ""
+
+    def query_pdf(self, file_name, query, chat_history, is_new_conversation):
+        """Query the PDF using LlamaIndex"""
+        logger.debug(f"Querying PDF: {file_name}")
+        logger.debug(f"Query: {query}")
+        logger.debug(f"Chat history: {chat_history}")
+        
+        if file_name not in self.indexes:
+            self.parse_and_embed_pdf(file_name)
+        
+        memory = ChatMemoryBuffer.from_defaults(token_limit=1500)
+        
+        if not is_new_conversation:
+            for message in chat_history[-4:]:  # Only use last 2 exchanges
+                role = MessageRole.USER if message['role'] == 'human' else MessageRole.ASSISTANT
+                memory.put(ChatMessage(role=role, content=message['content']))
+        
+        chat_engine = CondenseQuestionChatEngine.from_defaults(
+            query_engine=self.indexes[file_name].as_query_engine(),
+            memory=memory,
+            verbose=True
+        )
+        
+        response = chat_engine.chat(query)
+        logger.debug(f"Response: {response}")
+        return str(response)
+
+# Initialize parser
+parser = LlamaParser()
+
+@app.route('/', methods=['GET'])
+def test_route():
+    return jsonify({"status": "Server is running"}), 200
+
 @app.route('/api/pdf-files', methods=['GET'])
 def api_get_pdf_files():
-    pdf_files = [f for f in os.listdir(PDFS_FOLDER) if f.lower().endswith('.pdf')]
-    return jsonify({'pdf_files': pdf_files})
+    try:
+        pdf_dir = os.path.abspath(PDFS_FOLDER)
+        logger.debug(f"Looking for PDFs in: {pdf_dir}")
+        
+        if not os.path.exists(pdf_dir):
+            logger.error(f"PDF directory not found: {pdf_dir}")
+            return jsonify({'error': 'PDF directory not found', 'pdf_files': []}), 404
+        
+        pdf_files = [f for f in os.listdir(pdf_dir) if f.lower().endswith('.pdf')]
+        logger.debug(f"Found PDF files: {pdf_files}")
+        
+        return jsonify({'pdf_files': pdf_files})
+    except Exception as e:
+        logger.error(f"Error listing PDF files: {str(e)}")
+        return jsonify({'error': str(e), 'pdf_files': []}), 500
 
 @app.route('/api/query', methods=['POST'])
 def api_query():
     data = request.json
-    logger.debug(f"Received data: {data}")
+    logger.debug(f"Received query request: {data}")
 
     query = data.get('query')
     pdf_name = data.get('pdf_name')
@@ -223,54 +231,79 @@ def api_query():
         response = parser.query_pdf(pdf_name, query, conversation_history, is_new_conversation)
         return jsonify({'query': query, 'response': response})
     except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
+        logger.error(f"Query error: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
-@app.route('/api/background-image', methods=['GET'])
-def api_get_background_image():
-    pdf_name = request.args.get('pdf')
+@app.route('/api/analyze', methods=['POST', 'OPTIONS'])
+def api_analyze():
+    """Endpoint for analyzing PDF content"""
+    # Handle OPTIONS request for CORS
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        data = request.json
+        pdf_name = data.get('pdf_name')
+        analysis_type = data.get('analysis_type')
+        
+        if not pdf_name or not analysis_type:
+            return jsonify({'error': 'PDF name and analysis type are required'}), 400
+
+        logger.debug(f"Analyzing PDF: {pdf_name}, Type: {analysis_type}")
+        
+        # Get text from PDF
+        text = parser.get_pdf_text(pdf_name)
+        
+        if analysis_type == 'topics':
+            topics = parser.extract_key_topics(text)
+            return jsonify({'topics': topics})
+            
+        elif analysis_type == 'entities':
+            entities = parser.extract_named_entities(text)
+            return jsonify({'entities': entities})
+            
+        elif analysis_type == 'readability':
+            readability = parser.analyze_readability(text)
+            return jsonify({'readability': readability})
+            
+        else:
+            return jsonify({'error': 'Invalid analysis type'}), 400
+            
+    except Exception as e:
+        logger.error(f"Analysis error: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/get-pdf', methods=['GET'])
+def get_pdf():
+    pdf_name = request.args.get('pdf_name')
     if not pdf_name:
         return jsonify({'error': 'PDF name is required'}), 400
-
-    # Check for a custom image first
-    image_name = os.path.splitext(pdf_name)[0]  # Remove the .pdf extension
-    for ext in ['.jpg', '.jpeg', '.png']:
-        custom_image_path = os.path.join(CUSTOM_IMAGES_FOLDER, f"{image_name}{ext}")
-        if os.path.exists(custom_image_path):
-            return send_file(custom_image_path, mimetype=f'image/{ext[1:]}'), 200, {'X-Image-Type': 'custom'}
-
-    # If no custom image found, generate from PDF
-    pdf_path = os.path.join(PDFS_FOLDER, pdf_name)
-    if not os.path.exists(pdf_path):
-        return jsonify({'error': 'PDF not found'}), 404
-
-    try:
-        doc = fitz.open(pdf_path)
-        page = doc.load_page(0)  # Load the first page
-        pix = page.get_pixmap()
-        img_bytes = pix.tobytes("png")
         
-        return send_file(
-            io.BytesIO(img_bytes),
-            mimetype='image/png',
-            as_attachment=False,
-            download_name=f"{image_name}.png"
-        ), 200, {'X-Image-Type': 'generated'}
-    except Exception as e:
-        logger.error(f"Failed to process PDF: {str(e)}")
-        return jsonify({'error': f'Failed to process PDF: {str(e)}'}), 500
-
-@app.route('/api/pdf/<path:filename>')
-def serve_pdf(filename):
-    """Serve PDF files securely"""
     try:
+        pdf_path = os.path.join(PDFS_FOLDER, pdf_name)
         return send_file(
-            os.path.join(PDFS_FOLDER, filename),
-            mimetype='application/pdf'
+            pdf_path,
+            mimetype='application/pdf',
+            as_attachment=False,
+            download_name=pdf_name
         )
     except Exception as e:
-        return jsonify({'error': str(e)}), 404
+        logger.error(f"Error serving PDF: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    logger.info("Starting Flask server...")
+    logger.info(f"PDF directory path: {os.path.abspath(PDFS_FOLDER)}")
+    
+    try:
+        pdf_files = [f for f in os.listdir(PDFS_FOLDER) if f.lower().endswith('.pdf')]
+        logger.info(f"Available PDF files: {pdf_files}")
+    except Exception as e:
+        logger.error(f"Error checking PDF directory: {str(e)}")
+    
+    try:
+        app.run(debug=True, host='127.0.0.1', port=5000)
+    except Exception as e:
+        logger.error(f"Failed to start server: {str(e)}")
